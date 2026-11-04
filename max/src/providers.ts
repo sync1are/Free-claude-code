@@ -111,6 +111,7 @@ export const PROVIDERS: ProviderDef[] = [
     chatTemplateThinking: true,
     models: [
       "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+      "nvidia/nemotron-3-ultra-550b-a55b",
       "nvidia/nemotron-3-super-120b-a12b",
       "nvidia/nemotron-3-nano-30b-a3b",
       "nvidia/nemotron-3.5-lightning-30b-a3b",
@@ -140,31 +141,30 @@ export const PROVIDERS: ProviderDef[] = [
       "stepfun-ai/step-3.5-flash",
     ],    tierPatterns: {
       model: [
-        "llama-3\\.3-nemotron-super-49b",
-        "gpt-oss-120b",
-        "qwen3-next-80b-a3b-instruct",
-        "kimi-k2-instruct",
+        "nemotron-3-ultra",
+        "nemotron-3-super-120b",
+        "nemotron-3\\.5-lightning",
+        "kimi-k3",
         "deepseek-v4-flash",
-        "llama-3\\.3-70b",
+        "gpt-oss-120b",
+        "nemotron-super-49b",
       ],
       opus: [
         "kimi-k3",
+        "nemotron-3-ultra",
         "deepseek-v4-pro",
-        "deepseek-v4-flash",
-        "glm-5\\.3$",
-        "glm-(5\\.2|5\\.1|4\\.7)",
         "nemotron-3-super-120b",
         "minimax-m2\\.7",
         "kimi-k2-thinking",
-        "qwen3-next-80b-a3b-instruct",
+        "glm-5\\.3$",
       ],
       haiku: [
-        "phi-4-mini-instruct",
+        "nemotron-3\\.5-bolt",
         "nemotron-3-nano",
+        "phi-4-mini-instruct",
         "gpt-oss-20b",
         "mini-flash-reasoning",
         "8b-instruct",
-        "llama-3\\.2-3b",
       ],
     },
     fetchModels: async (key) => {
@@ -399,6 +399,25 @@ export function pickTiers(provider: ProviderDef, models: string[]): TierPick {
   };
 }
 
+/**
+ * Top-n ranked candidates for a tier (best first). Used as the retry ladder
+ * when the provider retires/EOLs the primary pick mid-flight.
+ */
+export function pickTierCandidates(
+  provider: ProviderDef,
+  models: string[],
+  tier: TierName,
+  n = 4,
+): string[] {
+  const patterns = provider.tierPatterns[tier] ?? [];
+  if (!patterns.length) return models.slice(0, n);
+  const scored = models
+    .map((m) => ({ m, s: scoreCandidate(m, patterns) }))
+    .filter((x) => x.s > 0)
+    .sort((a, b) => b.s - a.s);
+  return scored.slice(0, n).map((x) => x.m);
+}
+
 // ---------- cache ----------
 
 interface ModelsCache {
@@ -430,10 +449,52 @@ export interface ModelsResult {
   error?: string;
 }
 
+// ---------- dead-model memory ----------
+// When a provider answers "model reached its end of life", max remembers so it
+// stops picking that model in future launches. Entries expire after 14 days
+// (providers occasionally restore rotated models).
+
+const DEAD_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+
+function deadFile(): string {
+  return path.join(configDir(), "dead-models.json");
+}
+
+function readDead(): Record<string, Record<string, number>> {
+  return readJsonCache<Record<string, Record<string, number>>>(deadFile()) ?? {};
+}
+
+export function recordDeadModel(providerId: string, model: string): void {
+  if (!model) return;
+  const dead = readDead();
+  dead[providerId] = { ...(dead[providerId] ?? {}), [model]: Date.now() };
+  writeJsonCache(deadFile(), dead);
+}
+
+function dropDeadModels(provider: ProviderDef, models: string[]): string[] {
+  const dead = readDead()[provider.id] ?? {};
+  const now = Date.now();
+  const kept = models.filter((m) => {
+    const t = dead[m];
+    return !(typeof t === "number" && now - t < DEAD_TTL_MS);
+  });
+  // never drop everything — an all-dead catalog is worse than a dead pick
+  return kept.length ? kept : models;
+}
+
 /**
- * Fetch the provider's live model list (with 24h cache + bundled fallback).
+ * Fetch the provider's live model list (with 24h cache + bundled fallback),
+ * then filter out models we've observed being retired upstream.
  */
 export async function getModels(
+  provider: ProviderDef,
+  opts: { key?: string; refresh?: boolean } = {},
+): Promise<ModelsResult> {
+  const raw = await getModelsUncached(provider, opts);
+  return { ...raw, models: dropDeadModels(provider, raw.models) };
+}
+
+async function getModelsUncached(
   provider: ProviderDef,
   opts: { key?: string; refresh?: boolean } = {},
 ): Promise<ModelsResult> {

@@ -1,6 +1,6 @@
 {
   "name": "huzea",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "huzea -- launch Claude Code on free providers (NVIDIA NIM, Groq, Ollama, OpenRouter) with a built-in Anthropic<->OpenAI translation proxy",
   "bin": {
     "max": "dist/max.js"

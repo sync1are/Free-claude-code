@@ -25,6 +25,16 @@ function chunk(id, choiceDelta, extra = {}) {
 }
 
 function handle(body, res) {
+  // simulate a retired/EOL model: provider answers 410 with a descriptive body
+  if (String(body.model || "").startsWith("dead-")) {
+    res.writeHead(410, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: { message: `The model '${body.model}' has reached its end of life and is no longer available.` },
+      }),
+    );
+    return;
+  }
   const { messages = [] } = body;
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
   const userText =

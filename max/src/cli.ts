@@ -22,11 +22,14 @@ import { ask, confirm } from "./prompts";
 import {
   BUNDLED_AS_OF,
   getModels,
+  pickTierCandidates,
   pickTiers,
   PROVIDERS,
   ProviderDef,
+  recordDeadModel,
   resolveProvider,
   tierMarks,
+  type TierName,
   type TierPick,
 } from "./providers";
 import { startProxy, type ProxyOptions } from "./proxy";
@@ -386,6 +389,22 @@ async function cmdLaunch(tokens: string[]): Promise<void> {
     reasoningEffort: p.reasoningEffort,
     chatTemplateThinking: p.chatTemplateThinking,
     verbose: spec.verbose,
+    // self-healing ladder: every tier's model gets ranked backups, so an
+    // upstream EOL/retirement is retried transparently instead of failing
+    modelFallbacks: Object.fromEntries(
+      (["model", "opus", "haiku"] as const).map((policy) => [
+        tier[policy],
+        pickTierCandidates(p, models, policy as TierName, 8).filter((m) => m !== tier[policy]),
+      ]),
+    ),
+    // remember every model the provider reports as EOL/retired, so the next
+    // launch never picks it again
+    onDeadModel: (model) => {
+      recordDeadModel(p.id, model);
+      if (spec.verbose) {
+        process.stderr.write(`max proxy: recorded dead model (will be skipped): ${model}\n`);
+      }
+    },
   };
   const proxy = await startProxy(proxyOpts);
   console.log(`  ${green("proxy")} ${dim(`${proxy.url}   (Anthropic ⇄ OpenAI bridge, local only)`)}`);
@@ -661,12 +680,26 @@ async function cmdProxy(tokens: string[]): Promise<void> {
   let target = "";
   let key = "";
   let verbose = false;
+  const fallbacks: Record<string, string[]> = {};
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (t === "--target") target = tokens[++i] ?? "";
     else if (t === "--key") key = tokens[++i] ?? "";
     else if (t === "--verbose") verbose = true;
-    else {
+    else if (t === "--fallbacks") {
+      // "old=new1,new2;old2=new3" — model retry ladders (testing/diagnosis aid)
+      for (const pair of (tokens[++i] ?? "").split(";")) {
+        const eq = pair.indexOf("=");
+        if (eq > 0) {
+          const k = pair.slice(0, eq).trim();
+          fallbacks[k] = pair
+            .slice(eq + 1)
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        }
+      }
+    } else {
       console.error(red(`unknown token ${t}`));
       process.exit(2);
     }
@@ -680,6 +713,7 @@ async function cmdProxy(tokens: string[]): Promise<void> {
     targetBaseUrl: target,
     apiKey: key,
     verbose,
+    modelFallbacks: fallbacks,
     onActivity: ({ path, status, ms }) =>
       console.error(dim(`${path} → ${status} (${ms}ms)`)),
   });

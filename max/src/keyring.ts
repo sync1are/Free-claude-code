@@ -47,15 +47,18 @@ let vaultProbeCache: boolean | null = null;
 function vaultUsable(): boolean {
   if (vaultProbeCache !== null) return vaultProbeCache;
   try {
-    const script = `$v = ${PS_TYPE}\n$all = $v.RetrieveAll()\n[Console]::Error.Write([string]$all.Count)\nexit 0\n`;
-    const r = runPS(script);
-    vaultProbeCache = r.exitCode === 0;
+    // Full round-trip self-test: some Windows builds accept Add() but never
+    // persist, so verify with a real canary write/read/delete.
+    const canary = `canary-${Date.now()}`;
+    vaultProbeCache =
+      vaultSet("_max_canary", canary) && vaultGet("_max_canary") === canary;
+    vaultRemove("_max_canary");
   } catch {
     vaultProbeCache = false;
   }
   if (!vaultProbeCache) {
     process.stderr.write(
-      "max: Windows Credential Manager unavailable — falling back to plain ~/.max/keyring.json (less secure)\n",
+      "max: Windows Credential Manager self-test failed — using ~/.max/keyring.json (restricted to your user)\n",
     );
   }
   return vaultProbeCache;

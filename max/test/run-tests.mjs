@@ -23,9 +23,9 @@ function ok(name, cond, extra = "") {
   }
 }
 
-async function startProxy(target, key = "test-key") {
+async function startProxy(target, key = "test-key", extraArgs = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [DIST, "proxy", "--target", target, "--key", key], {
+    const child = spawn(process.execPath, [DIST, "proxy", "--target", target, "--key", key, ...extraArgs], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let buf = "";
@@ -201,6 +201,51 @@ async function main() {
     });
     // mock always 200s; force a 502 by targetting mock with bad path? simulate 404 path instead:
     ok("error path sanity (mock always 200)", r.status === 200);
+  }
+
+  // ---------- model fallback ladder (self-healing EOL/retired models) ----------
+  {
+    const proxy2 = await startProxy(mock.baseUrl(), "test-key", ["--fallbacks", "dead-leg-v1=live-fallback"]);
+    const base2 = `http://127.0.0.1:${proxy2.port}`;
+
+    // non-stream: dead model is retried transparently with the fallback
+    const r1 = await fetch(`${base2}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "dead-leg-v1", max_tokens: 50, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const j1 = await r1.json();
+    ok("ladder: dead model retried transparently", r1.status === 200 && j1.content?.[0]?.text === "Hello world");
+    ok("ladder: response labeled with the fallback model", j1.model === "live-fallback");
+
+    // streaming through the ladder
+    const r2 = await fetch(`${base2}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "dead-leg-v1",
+        max_tokens: 50,
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    const t2 = await r2.text();
+    ok("ladder: stream works after retry", r2.status === 200 && /message_stop/.test(t2) && /Hello/.test(t2));
+
+    // dead model with NO ladder configured -> provider error passes through
+    const r3 = await fetch(`${base2}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "dead-zi-no-ladder", max_tokens: 50, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const j3 = await r3.json();
+    ok(
+      "ladder: no fallback -> provider EOL error surfaces",
+      r3.status === 410 && /no longer available/.test(j3?.error?.message ?? ""),
+      JSON.stringify(j3),
+    );
+
+    proxy2.child.kill();
   }
 
   await mock.stop();

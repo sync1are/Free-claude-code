@@ -24,6 +24,13 @@ export interface ProxyOptions {
   reasoningEffort?: boolean;
   chatTemplateThinking?: boolean;
   verbose?: boolean;
+  /**
+   * Fallback ladders per requested model id. When a provider answers
+   * 4xx "model unavailable / end of life", the proxy retries the next entry.
+   */
+  modelFallbacks?: Record<string, string[]>;
+  /** called each time a model id is rejected as retired/EOL/unknown upstream */
+  onDeadModel?: (model: string) => void;
   onActivity?: (info: { path: string; status: number; ms: number }) => void;
 }
 
@@ -82,6 +89,14 @@ function readBody(req: http.IncomingMessage): Promise<Buffer> {
 
 function estimateTokens(obj: unknown): number {
   return Math.ceil(JSON.stringify(obj ?? "").length / 4);
+}
+
+/** Did the provider reject the model itself (as opposed to the request or key)? */
+function isModelUnavailable(up: Response, body: string): boolean {
+  if (up.status === 404 || up.status === 410) return true;
+  return /end of life|no longer available|model(\s|_|-|)*(not|no longer).{0,20}(available|exist|supported)|unsupported model|invalid model|unknown model|model_not_found|deprecat/i.test(
+    body,
+  );
 }
 
 function stripSchemaExtras(schema: unknown): unknown {
@@ -844,31 +859,56 @@ async function handleMessages(req: http.IncomingMessage, res: http.ServerRespons
     );
   }
 
-  let up: Response;
-  try {
-    up = await fetch(url, {
-      method: "POST",
-      headers: upstreamHeaders(o),
-      body: JSON.stringify(oaReq),
-      signal: ac.signal,
-    });
-  } catch (e: any) {
-    if (e?.name === "TimeoutError") {
-      return sendAnthropicError(res, 504, `upstream timed out after 240s`);
+  // Model ladder: if the requested model was deprecated/EOL'd/renamed upstream,
+  // transparently retry with the next-best ranked candidate for the same tier.
+  const ladder = [
+    ant.model,
+    ...(o.modelFallbacks?.[ant.model]?.filter((m) => m && m !== ant.model) ?? []),
+  ];
+  let up: Response | null = null;
+  let usedModel = ant.model;
+  let lastBody = "";
+  for (let attempt = 0; attempt < ladder.length; attempt++) {
+    usedModel = ladder[attempt];
+    try {
+      up = await fetch(url, {
+        method: "POST",
+        headers: upstreamHeaders(o),
+        body: JSON.stringify({ ...oaReq, model: usedModel }),
+        signal: ac.signal,
+      });
+    } catch (e: any) {
+      if (e?.name === "AbortError") return; // client hung up
+      return sendAnthropicError(res, 502, `cannot reach ${hostOf(o.targetBaseUrl)} — ${e?.message ?? e}`);
     }
-    if (e?.name === "AbortError") return; // client hung up
-    return sendAnthropicError(res, 502, `cannot reach ${hostOf(o.targetBaseUrl)} — ${e?.message ?? e}`);
+    if (up.ok) break;
+    lastBody = await up.text().catch(() => "");
+    if (isModelUnavailable(up, lastBody)) {
+      o.onDeadModel?.(usedModel);
+      if (attempt < ladder.length - 1) {
+        if (o.verbose) {
+          process.stderr.write(
+            `max proxy: model ${usedModel} is unavailable upstream (HTTP ${up.status}) — retrying with ${ladder[attempt + 1]}\n`,
+          );
+        }
+        up = null;
+        continue;
+      }
+    }
+    break;
+  }
+  if (!up) {
+    return sendAnthropicError(res, 502, `no candidate model was accepted by ${hostOf(o.targetBaseUrl)}`);
   }
 
   if (!up.ok) {
     if (clientGone) return;
-    const text = await up.text().catch(() => "");
     let msg: string | undefined;
     try {
-      const j = JSON.parse(text);
+      const j = JSON.parse(lastBody);
       msg = j?.error?.message ?? j?.message ?? j?.detail ?? j?.error ?? undefined;
     } catch {
-      /* not json */
+      msg = lastBody.slice(0, 300) || undefined;
     }
     const status = up.status;
     const hint =
@@ -894,11 +934,11 @@ async function handleMessages(req: http.IncomingMessage, res: http.ServerRespons
       });
     }
     if (ct.includes("event-stream")) {
-      await translateStreamToAnthropic(up, res, ant.model, inTokens);
+      await translateStreamToAnthropic(up, res, usedModel, inTokens);
     } else {
       try {
         const j = await up.json();
-        await synthesizeStreamFromObject(j, res, ant.model, inTokens);
+        await synthesizeStreamFromObject(j, res, usedModel, inTokens);
       } catch (e: any) {
         o.verbose && process.stderr.write(`max proxy: upstream stream body unparsable — ${e?.message ?? e}\n`);
       }
@@ -918,6 +958,6 @@ async function handleMessages(req: http.IncomingMessage, res: http.ServerRespons
   } else {
     j = await up.json();
   }
-  const antOut = openaiToAnthropic(j, ant.model);
+  const antOut = openaiToAnthropic(j, usedModel);
   jsonWrite(res, 200, antOut);
 }
