@@ -1,0 +1,40 @@
+{
+  "name": "huzea",
+  "version": "0.1.0",
+  "description": "huzea -- launch Claude Code on free providers (NVIDIA NIM, Groq, Ollama, OpenRouter) with a built-in Anthropic<->OpenAI translation proxy",
+  "bin": {
+    "max": "dist/max.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node test/run-tests.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "claude-code",
+    "nvidia-nim",
+    "groq",
+    "ollama",
+    "openrouter",
+    "free",
+    "cli"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}
